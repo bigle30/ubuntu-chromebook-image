@@ -5,7 +5,6 @@ on:
     - cron: '0 0 * * *'
   push:
     branches: [main]
-    tags: ['v*'] # Trigger release on tags
   workflow_dispatch:
 
 jobs:
@@ -13,45 +12,63 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt update
-          sudo apt install -y gdisk qemu-user-static wget xz-utils cgpt
-          sudo snap install --classic ubuntu-image
+          sudo apt install -y gdisk qemu-user-static wget xz-utils cgpt \
+          make gcc-aarch64-linux-gnu bc libelf-dev flex bison python3-pip golang-go
 
-      - name: Prepare Gadget
+      - name: Setup Go & Submarine Tools
         run: |
-          mkdir -p gadget
-          wget -P gadget https://github.com/osresearch/submarine/releases/download/v0.1/submarine-a64.kpart
+          # Install u-root and ensure it's in the PATH for the next steps
+          go install github.com/u-root/u-root@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          
+          # Install depthcharge-tools to sign the Chromebook kernel partition
+          # Using --break-system-packages is safe in an ephemeral GH Action runner
+          pip3 install --break-system-packages depthcharge-tools
 
-      - name: Build Desktop Image
+      - name: Build Submarine from Source
         run: |
-          # Load loop module (crucial for GH runners)
+          # Shallow clone to save time/space
+          git clone --recurse-submodules --depth 1 https://github.com/FyraLabs/submarine build-submarine
+          cd build-submarine
+          
+          # Cross-compile for the MT8186 (Corsola/Magenton) architecture
+          # -j$(nproc) uses all available CPU cores
+          make -j$(nproc) arm64
+          
+          # Prepare the gadget directory for ubuntu-image
+          mkdir -p ../gadget
+          cp build/submarine-arm64.kpart ../gadget/submarine-a64.kpart
+
+      - name: Build Ubuntu Image
+        run: |
+          # Essential for ubuntu-image to mount the filesystem
           sudo modprobe loop
           
-          # Build the image
-          sudo ubuntu-image classic -i 8G chromebook-corsola-desktop.yaml --output corsola-desktop.img
-          
-          # Set ChromeOS boot bits via cgpt (more reliable than sgdisk -A for Depthcharge)
-          sudo cgpt add -i 1 -S 1 -T 1 -P 10 corsola-desktop.img
+          # Run the build. 
+          # Ensure chromebook-corsola-desktop.yaml is in your repo root.
+          sudo ubuntu-image classic -i 8G chromebook-corsola-desktop.yaml --output corsola-ubuntu.img
 
-      - name: Compress Image
+      - name: Apply ChromeOS Boot Flags
         run: |
-          # GitHub Artifacts have a size limit; XZ compression is mandatory for 8GB images
-          xz -T0 -9 corsola-desktop.img
+          # Depthcharge firmware requires specific GPT priority bits
+          # -P 10 sets high priority, -S 1 marks as a successful boot partition
+          sudo cgpt add -i 1 -S 1 -T 1 -P 10 corsola-ubuntu.img
+
+      - name: Compress and Finalize
+        run: |
+          # Maximize compression to stay under artifact limits
+          xz -T0 -9 corsola-ubuntu.img
+          mv corsola-ubuntu.img.xz ubuntu-corsola-$(date +%Y%m%d).img.xz
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: corsola-desktop-xz
-          path: corsola-desktop.img.xz
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: corsola-desktop.img.xz
-          generate_release_notes: true
+          name: ubuntu-corsola-full-build
+          path: "*.img.xz"
