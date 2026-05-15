@@ -1,12 +1,10 @@
-name: Automated image builds
+name: Automated Patched Image Build
 
 on:
-  schedule:
-    - cron: '0 0 * * *'  # Daily build at midnight
   push:
     branches: [main]
-    tags: ['v*']        # Trigger on version tags
-  workflow_dispatch:      # Manual trigger
+    tags: ['v*']
+  workflow_dispatch:
 
 jobs:
   build:
@@ -25,24 +23,23 @@ jobs:
 
       - name: Setup Go & Submarine Tools
         run: |
-          # Install u-root for initramfs creation
+          # Patch: Ensure u-root is in the executable path for the Makefile
           go install github.com/u-root/u-root@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           
-          # Install depthcharge-tools for ChromeOS signing
+          # Patch: Install tools into the user environment to avoid sudo/root conflicts
           pip3 install --break-system-packages depthcharge-tools
 
-      - name: Build Submarine from Source
+      - name: Build Submarine from Source (Patched)
         run: |
-          # Clone the official FyraLabs repository
           git clone --recurse-submodules --depth 1 https://github.com/FyraLabs/submarine build-submarine
           cd build-submarine
           
-          # 1. Compile Submarine for ARM64
+          # Patch: Run compilation for MT8186/ARM64
           make -j$(nproc) arm64
           
-          # 2. Manual Packaging (Fixes Permission Denied on /boot)
-          # We explicitly point to our build artifacts to ignore host files
+          # Patch: Explicitly bypass host /boot directory to fix Permission Denied (Errno 13)
+          # This forces the packager to only use the local 'build' folder
           depthchargectl build -v \
             --board arm64-generic \
             --kernel build/bzImage.a64 \
@@ -52,38 +49,36 @@ jobs:
             --kernel-cmdline "console=tty0" \
             --output build/submarine-arm64.kpart
 
-          # 3. Move to gadget directory for ubuntu-image
+          # Prepare gadget for the main Ubuntu image build
           mkdir -p ../gadget
           cp build/submarine-arm64.kpart ../gadget/submarine-a64.kpart
 
       - name: Build Ubuntu Image
         run: |
-          # Required for ubuntu-image to mount loop devices
           sudo modprobe loop
-          
-          # Start the Ubuntu build (Ensure your YAML file exists in the root)
+          # Patch: Use ubuntu-image to wrap everything into the .img
+          # Assumes chromebook-corsola-desktop.yaml is in your repo root
           sudo ubuntu-image classic -i 8G chromebook-corsola-desktop.yaml --output corsola-ubuntu.img
 
-      - name: Apply ChromeOS Boot Flags
+      - name: Patch Partition Flags
         run: |
-          # Partition 1 needs to be marked as bootable/success for Depthcharge
+          # Crucial for Magenton: mark Partition 1 as Priority 10 and Successful
+          # Without this, the Chromebook will skip the USB/SD card during boot
           sudo cgpt add -i 1 -S 1 -T 1 -P 10 corsola-ubuntu.img
 
-      - name: Compress and Finalize
+      - name: Compress and Release
         run: |
-          # Use XZ for maximum compression
           xz -T0 -9 corsola-ubuntu.img
-          mv corsola-ubuntu.img.xz ubuntu-corsola-$(date +%Y%m%d).img.xz
+          mv corsola-ubuntu.img.xz ubuntu-corsola-patched-$(date +%Y%m%d).img.xz
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ubuntu-corsola-full-build
+          name: ubuntu-corsola-patched
           path: "*.img.xz"
 
-      - name: Create GitHub Release
+      - name: GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: "*.img.xz"
-          generate_release_notes: true
