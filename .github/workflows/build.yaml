@@ -1,0 +1,57 @@
+name: Automated image builds
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches: [main]
+    tags: ['v*'] # Trigger release on tags
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y gdisk qemu-user-static wget xz-utils cgpt
+          sudo snap install --classic ubuntu-image
+
+      - name: Prepare Gadget
+        run: |
+          mkdir -p gadget
+          wget -P gadget https://github.com/osresearch/submarine/releases/download/v0.1/submarine-a64.kpart
+
+      - name: Build Desktop Image
+        run: |
+          # Load loop module (crucial for GH runners)
+          sudo modprobe loop
+          
+          # Build the image
+          sudo ubuntu-image classic -i 8G chromebook-corsola-desktop.yaml --output corsola-desktop.img
+          
+          # Set ChromeOS boot bits via cgpt (more reliable than sgdisk -A for Depthcharge)
+          sudo cgpt add -i 1 -S 1 -T 1 -P 10 corsola-desktop.img
+
+      - name: Compress Image
+        run: |
+          # GitHub Artifacts have a size limit; XZ compression is mandatory for 8GB images
+          xz -T0 -9 corsola-desktop.img
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corsola-desktop-xz
+          path: corsola-desktop.img.xz
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corsola-desktop.img.xz
+          generate_release_notes: true
