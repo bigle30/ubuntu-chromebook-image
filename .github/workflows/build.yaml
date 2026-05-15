@@ -2,10 +2,11 @@ name: Automated image builds
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 0 * * *'  # Daily build at midnight
   push:
     branches: [main]
-  workflow_dispatch:
+    tags: ['v*']        # Trigger on version tags
+  workflow_dispatch:      # Manual trigger
 
 jobs:
   build:
@@ -24,46 +25,53 @@ jobs:
 
       - name: Setup Go & Submarine Tools
         run: |
-          # Install u-root and ensure it's in the PATH for the next steps
+          # Install u-root for initramfs creation
           go install github.com/u-root/u-root@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           
-          # Install depthcharge-tools to sign the Chromebook kernel partition
-          # Using --break-system-packages is safe in an ephemeral GH Action runner
+          # Install depthcharge-tools for ChromeOS signing
           pip3 install --break-system-packages depthcharge-tools
 
       - name: Build Submarine from Source
         run: |
-          # Shallow clone to save time/space
+          # Clone the official FyraLabs repository
           git clone --recurse-submodules --depth 1 https://github.com/FyraLabs/submarine build-submarine
           cd build-submarine
           
-          # Cross-compile for the MT8186 (Corsola/Magenton) architecture
-          # -j$(nproc) uses all available CPU cores
+          # 1. Compile Submarine for ARM64
           make -j$(nproc) arm64
           
-          # Prepare the gadget directory for ubuntu-image
+          # 2. Manual Packaging (Fixes Permission Denied on /boot)
+          # We explicitly point to our build artifacts to ignore host files
+          depthchargectl build -v \
+            --board arm64-generic \
+            --kernel build/bzImage.a64 \
+            --initramfs build/initramfs-arm64.cpio.gz \
+            --fdtdir build/dtbs \
+            --root none \
+            --kernel-cmdline "console=tty0" \
+            --output build/submarine-arm64.kpart
+
+          # 3. Move to gadget directory for ubuntu-image
           mkdir -p ../gadget
           cp build/submarine-arm64.kpart ../gadget/submarine-a64.kpart
 
       - name: Build Ubuntu Image
         run: |
-          # Essential for ubuntu-image to mount the filesystem
+          # Required for ubuntu-image to mount loop devices
           sudo modprobe loop
           
-          # Run the build. 
-          # Ensure chromebook-corsola-desktop.yaml is in your repo root.
+          # Start the Ubuntu build (Ensure your YAML file exists in the root)
           sudo ubuntu-image classic -i 8G chromebook-corsola-desktop.yaml --output corsola-ubuntu.img
 
       - name: Apply ChromeOS Boot Flags
         run: |
-          # Depthcharge firmware requires specific GPT priority bits
-          # -P 10 sets high priority, -S 1 marks as a successful boot partition
+          # Partition 1 needs to be marked as bootable/success for Depthcharge
           sudo cgpt add -i 1 -S 1 -T 1 -P 10 corsola-ubuntu.img
 
       - name: Compress and Finalize
         run: |
-          # Maximize compression to stay under artifact limits
+          # Use XZ for maximum compression
           xz -T0 -9 corsola-ubuntu.img
           mv corsola-ubuntu.img.xz ubuntu-corsola-$(date +%Y%m%d).img.xz
 
@@ -72,3 +80,10 @@ jobs:
         with:
           name: ubuntu-corsola-full-build
           path: "*.img.xz"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.img.xz"
+          generate_release_notes: true
