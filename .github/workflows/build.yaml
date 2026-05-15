@@ -1,82 +1,56 @@
-name: Build Ubuntu for Corsola (Magneton)
+name: Build Ubuntu Corsola
 
 on:
-  workflow_dispatch: # Allows manual trigger
   push:
     branches: [ main ]
+  workflow_dispatch: # Enable manual run button
 
 jobs:
-  build-image:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Build Dependencies
+      - name: Install Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y wget xz-utils vboot-utils vboot-kernel-utils sgdisk gdisk
           sudo snap install --classic ubuntu-image
 
-      - name: Setup Filesystem Overlay for Suspend Fix
+      - name: Create Suspend Fix Overlay
         run: |
-          # Create the directory structure for the systemd service
           mkdir -p overlay/etc/systemd/system/multi-user.target.wants/
-          
-          # Create the fix service for the EC timeout (The Magneton Workaround)
           cat <<EOF > overlay/etc/systemd/system/cros-ec-suspend-fix.service
 [Unit]
-Description=Fix Magneton Suspend Timeout (cros_ec)
+Description=Fix Magneton Suspend Timeout
 After=sys-kernel-debug.mount
-ConditionPathExists=/sys/kernel/debug/cros_ec/suspend_timeout_ms
-
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'echo 65535 > /sys/kernel/debug/cros_ec/suspend_timeout_ms'
-RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
-          # Enable the service within the overlay
           ln -s /etc/systemd/system/cros-ec-suspend-fix.service \
           overlay/etc/systemd/system/multi-user.target.wants/cros-ec-suspend-fix.service
 
-      - name: Prepare Kernel Cmdline
+      - name: Fetch Submarine
         run: |
-          # strictly hexdump's suggested parameters + corsola specifics
-          # root=LABEL=writable is standard for ubuntu-image builds
-          echo "console=tty1 root=LABEL=writable rootwait rw ignore_loglevel cros_ec.mod_delay_ms=2000" > cmdline.txt
-
-      - name: Fetch and Patch Submarine Bootloader
-        run: |
-          # Fetching the latest submarine kpart
           wget https://nightly.link/FyraLabs/submarine/workflows/build/main/submarine-arm64.zip
           unzip -j submarine-arm64.zip submarine-a64.kpart -d .
-          
-          # Inject our cmdline.txt into the kpart for Depthcharge to read
-          vbutil_kernel --repack submarine-a64.kpart \
-            --oldblob submarine-a64.kpart \
-            --config cmdline.txt
+          echo "console=tty1 root=LABEL=writable rootwait rw ignore_loglevel cros_ec.mod_delay_ms=2000" > cmdline.txt
+          vbutil_kernel --repack submarine-a64.kpart --oldblob submarine-a64.kpart --config cmdline.txt
 
-      - name: Build Ubuntu Image
+      - name: Build Image
         run: |
-          # Ensure your YAML model (from tobhe) is named 'corsola.yaml' in your repo
-          # This command uses the overlay folder we created for the suspend fix
-          ubuntu-image classic -i 8G \
-            --output ubuntu-corsola.img \
-            --overlay-dir overlay/ \
-            corsola.yaml
+          # Note: Ensure corsola.yaml exists in your repo root
+          sudo ubuntu-image classic -i 8G --output ubuntu-corsola.img --overlay-dir overlay/ corsola.yaml
 
-      - name: Apply ChromeOS GPT Attributes
-        run: |
-          # Crucial: This tells the Chromebook that partition 1 is bootable
-          # 1:or:11f000000000000 sets Priority=15, Tries=15, Successful=1
-          sgdisk -A 1:or:11f000000000000 ubuntu-corsola.img
+      - name: Set Boot Flags
+        run: sudo sgdisk -A 1:or:11f000000000000 ubuntu-corsola.img
 
-      - name: Compress and Upload
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ubuntu-corsola-magneton-fixed
+          name: ubuntu-corsola-fixed
           path: ubuntu-corsola.img
